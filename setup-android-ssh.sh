@@ -177,6 +177,28 @@ EOF
     fi
 fi
 
+# Handle host key verification (changed/new keys)
+HOST_KEY_STATUS=$(ssh -o BatchMode=yes -o ConnectTimeout=5 -p "$SSH_PORT" "$TERMUX_USER@$ANDROID_IP" "exit" 2>&1) || true
+if echo "$HOST_KEY_STATUS" | grep -q "REMOTE HOST IDENTIFICATION HAS CHANGED"; then
+    echo -e "${RED}Host key changed (Termux reinstalled?)${NC}"
+    read -p "Remove old key and accept new? (y/n): " accept_new
+    if [[ $accept_new =~ ^[Yy]$ ]]; then
+        ssh-keygen -R "[$ANDROID_IP]:$SSH_PORT" 2>/dev/null || true
+        ssh-keygen -R "$ANDROID_IP" 2>/dev/null || true
+        echo "Old key removed. Fetching new key..."
+        ssh-keyscan -p "$SSH_PORT" "$ANDROID_IP" >> "$HOME/.ssh/known_hosts" 2>/dev/null
+    else
+        echo "Aborted. Fix manually: ssh-keygen -R \"[$ANDROID_IP]:$SSH_PORT\""
+        exit 1
+    fi
+elif echo "$HOST_KEY_STATUS" | grep -qi "host key verification failed"; then
+    echo "Host key issue detected. Fetching key..."
+    ssh-keyscan -p "$SSH_PORT" "$ANDROID_IP" >> "$HOME/.ssh/known_hosts" 2>/dev/null
+elif ! ssh-keygen -F "[$ANDROID_IP]:$SSH_PORT" &>/dev/null && ! ssh-keygen -F "$ANDROID_IP" &>/dev/null; then
+    echo "New host. Fetching key..."
+    ssh-keyscan -p "$SSH_PORT" "$ANDROID_IP" >> "$HOME/.ssh/known_hosts" 2>/dev/null
+fi
+
 echo "Deploying key (enter Termux password)..."
 KEY_DEPLOYED=false
 if command -v ssh-copy-id &>/dev/null; then
@@ -195,9 +217,9 @@ else
 fi
 
 if [ "$KEY_DEPLOYED" = true ]; then
-    ssh -p "$SSH_PORT" -i "$KEY_PATH" "$TERMUX_USER@$ANDROID_IP" "chmod 700 ~/.ssh && chmod 600 ~/.ssh/authorized_keys" 2>/dev/null
+    ssh -p "$SSH_PORT" -i "$KEY_PATH" "$TERMUX_USER@$ANDROID_IP" "chmod 700 ~/.ssh && chmod 600 ~/.ssh/authorized_keys" 2>/dev/null || true
 
-    ssh -p "$SSH_PORT" -i "$KEY_PATH" "$TERMUX_USER@$ANDROID_IP" bash <<'EOFANDROID' 2>/dev/null
+    ssh -p "$SSH_PORT" -i "$KEY_PATH" "$TERMUX_USER@$ANDROID_IP" bash <<'EOFANDROID' 2>/dev/null || true
 cp $PREFIX/etc/ssh/sshd_config $PREFIX/etc/ssh/sshd_config.backup 2>/dev/null || true
 
 if grep -q "^PubkeyAuthentication" $PREFIX/etc/ssh/sshd_config; then
@@ -219,7 +241,51 @@ else
 fi
 EOFANDROID
 
-    ssh -p "$SSH_PORT" -i "$KEY_PATH" "$TERMUX_USER@$ANDROID_IP" "pkill sshd; sshd" 2>/dev/null
+    ssh -p "$SSH_PORT" -i "$KEY_PATH" "$TERMUX_USER@$ANDROID_IP" "pkill sshd; sshd" 2>/dev/null || true
+
+    # Check and acquire storage permission
+    if ! ssh -p "$SSH_PORT" -i "$KEY_PATH" "$TERMUX_USER@$ANDROID_IP" "test -d ~/storage/shared" 2>/dev/null; then
+        echo ""
+        echo "Storage permission missing. Required to access Android files."
+        read -p "Grant storage permission now? (y/n): " grant_storage
+        if [[ $grant_storage =~ ^[Yy]$ ]]; then
+            echo "Open Termux app on phone (must be visible for dialog)"
+            read -p "Press Enter when Termux is open..."
+            echo "Triggering permission dialog..."
+            ssh -p "$SSH_PORT" -i "$KEY_PATH" "$TERMUX_USER@$ANDROID_IP" "termux-setup-storage" 2>/dev/null &
+            SSH_PID=$!
+            echo "Grant permission on phone, then press Enter..."
+            read -r
+            kill $SSH_PID 2>/dev/null || true
+            wait $SSH_PID 2>/dev/null || true
+            if ssh -p "$SSH_PORT" -i "$KEY_PATH" "$TERMUX_USER@$ANDROID_IP" "test -d ~/storage/shared" 2>/dev/null; then
+                echo "Storage permission granted"
+            else
+                echo -e "${RED}Storage permission not detected. Run manually: termux-setup-storage${NC}"
+            fi
+        fi
+    else
+        echo "Storage permission: OK"
+    fi
+
+    # Check and install termux-api
+    if ! ssh -p "$SSH_PORT" -i "$KEY_PATH" "$TERMUX_USER@$ANDROID_IP" "command -v termux-wake-lock" >/dev/null 2>&1; then
+        echo ""
+        echo "termux-api not installed. Required for wake lock (prevents Android killing sshd)."
+        read -p "Install termux-api? (y/n): " install_api
+        if [[ $install_api =~ ^[Yy]$ ]]; then
+            echo "Installing termux-api (may take a moment)..."
+            if ssh -p "$SSH_PORT" -i "$KEY_PATH" "$TERMUX_USER@$ANDROID_IP" "pkg install -y termux-api" 2>/dev/null; then
+                echo "termux-api installed"
+                echo ""
+                echo "Also install Termux:API app from F-Droid for wake lock to work"
+            else
+                echo -e "${RED}Install failed. Run manually: pkg install termux-api${NC}"
+            fi
+        fi
+    else
+        echo "termux-api: OK"
+    fi
 
     read -p "Setup Termux:Boot? (y/n): " setup_boot
     if [[ $setup_boot =~ ^[Yy]$ ]]; then
@@ -242,15 +308,14 @@ EOFANDROID
                 BOOT_SCRIPT_CONTENT=$(echo "$BOOT_SCRIPT_CONTENT" | grep -v "termux-wake-lock")
             fi
 
-            ssh -p "$SSH_PORT" -i "$KEY_PATH" "$TERMUX_USER@$ANDROID_IP" bash <<EOFBOOT 2>/dev/null
+            if ssh -p "$SSH_PORT" -i "$KEY_PATH" "$TERMUX_USER@$ANDROID_IP" bash <<EOFBOOT 2>/dev/null
 mkdir -p ~/.termux/boot
 cat > ~/.termux/boot/start-sshd <<'EOFSCRIPT'
 $BOOT_SCRIPT_CONTENT
 EOFSCRIPT
 chmod +x ~/.termux/boot/start-sshd
 EOFBOOT
-
-            if [ $? -eq 0 ]; then
+            then
                 echo ""
                 echo "Termux:Boot script created"
                 echo ""
